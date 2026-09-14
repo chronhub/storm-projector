@@ -40,8 +40,8 @@ use Throwable;
  * a real Postgres with a lease-stealing or poison read model; here the failure is injected at the FIRST
  * stage, where AcquireCheckpoint reads the checkpoint via the store's `fetchOne`, the production trigger of
  * LeaseLost, so each arm is pinned without a database. The Connection is mocked: `transactional()` runs the
- * closure, the pre-loop store calls succeed, and `fetchOne`, which only the in-pipeline checkpoint read
- * calls, is the lever. The observable is the RunContext the `finally` emits with the SAME finalStatus and
+ * closure, the pre-loop store calls succeed, and the checkpoint query through `fetchOne` is the lever. The observable is the `RunContext` the
+ * `finally` emits with the SAME final status and
  * failure it hands to `releaseLease`, plus the release SQL the store actually issued.
  */
 final class ProjectionRunnerTest extends TestCase
@@ -51,13 +51,19 @@ final class ProjectionRunnerTest extends TestCase
     private const string OWNER = 'worker-a';
 
     #[Test]
-    public function a_lost_lease_releases_idle_with_no_failure_and_does_not_rethrow(): void
+    public function a_lost_lease_releases_idle_with_no_failure_and_reports_the_hand_off(): void
     {
         // a checkpoint read finding no owned row raises LeaseLost, a clean hand-off: the runner exits without
-        // throwing, releasing Idle and null failure so the new owner's row is left untouched
+        // throwing, releasing Idle and null failure so the new owner's row is left untouched. The outcome
+        // still has to say the lease went: a run dispossessed mid-batch is neither a finished catch-up nor
+        // one of the three stand-downs, and the caller exits non-zero on it so a supervisor relaunches
         $obs = new RecordingObservability;
         // false means the FOR-UPDATE checkpoint select matched no row we still own, so LeaseLost::to() is thrown
-        $this->runner($obs, fetchOneResult: false)->run(self::NAME, $this->onceOptions());
+        $outcome = $this->runner($obs, fetchOneResult: false)->run(self::NAME, $this->onceOptions());
+
+        $this->assertTrue($outcome->started());      // the run DID begin, so no stand-down reason is carried
+        $this->assertNull($outcome->standDown);
+        $this->assertFalse($outcome->completed());   // and it never reached the end of its own catch-up
 
         $run = $this->recordedRun($obs);
         $this->assertSame(ProjectionStatus::Idle->value, $run->finalStatus); // not Failed
@@ -165,14 +171,26 @@ final class ProjectionRunnerTest extends TestCase
             throw new RuntimeException('telemetry sink dead');
         };
 
-        $this->runner($obs, fetchOneResult: 0)->run(self::NAME, $this->onceOptions());
+        $outcome = $this->runner($obs, fetchOneResult: 0)->run(self::NAME, $this->onceOptions());
 
+        $this->assertTrue($outcome->completed()); // the batch reached its own end: a dead sink is no hand-off
         $run = $this->recordedRun($obs);
         $this->assertSame(ProjectionStatus::Idle->value, $run->finalStatus);
         $this->assertNull($run->error);
         $this->assertSame(ProjectionStatus::Idle, $this->released()->status);
         $this->assertFalse($this->released()->hasError);
     }
+
+    #[Test]
+    public function startup_locks_before_claiming_and_commits_before_running(): void
+    {
+        $this->runner(new RecordingObservability)->run(self::NAME, $this->onceOptions());
+
+        self::assertSame(['begin', 'lock', 'claim', 'commit', 'run'], $this->startup);
+    }
+
+    /** @var list<string> */
+    private array $startup = [];
 
     /** Captures the status and error releaseLease was actually issued with, decoded from the store's SQL. */
     private ?ReleasedLease $released = null;
@@ -238,12 +256,24 @@ final class ProjectionRunnerTest extends TestCase
         // a stub, not a mock: behavior is configured, but the call counts are not the contract under test;
         // the observable is the released status and the rethrow, not "executeStatement was called N times"
         $connection = $this->createStub(Connection::class);
+        $connection->method('beginTransaction')->willReturnCallback(function (): void {
+            $this->startup[] = 'begin';
+        });
+        $connection->method('commit')->willReturnCallback(function (): void {
+            $this->startup[] = 'commit';
+        });
 
         // the pre-loop store writes, ensure / resumeIfElapsed / markRunning / renewLease, and the lease claim:
         // claimLease needs a positive affected count, the rest ignore it. releaseLease's SQL is captured.
         // markRunning is the only statement setting `status = :status` gated on `lease_owner = :owner`;
         // returning 0 for it simulates an operator's mark winning the claim window.
         $connection->method('executeStatement')->willReturnCallback(function (string $sql, array $params = []) use ($markRunningWins): int {
+            if (str_contains($sql, 'lease_owner = :owner,')) {
+                $this->startup[] = 'claim';
+            }
+            if (str_contains($sql, 'SET status = :status') && str_contains($sql, 'lease_owner = :owner')) {
+                $this->startup[] = 'run';
+            }
             if (str_contains($sql, 'lease_owner = NULL')) { // the release SQL; capture which branch ran
                 $this->released = ReleasedLease::fromReleaseSql($sql, $params);
             }
@@ -266,13 +296,20 @@ final class ProjectionRunnerTest extends TestCase
         // transactional runs the closure, the pipeline, against the same connection, like the real driver.
         $connection->method('transactional')->willReturnCallback(static fn (callable $cb): mixed => $cb($connection));
 
-        // fetchOne is ONLY reached from acquireCheckpoint, inside the pipeline, the single injection point.
-        $fetchOne = $connection->method('fetchOne');
-        if ($fetchOneThrows !== null) {
-            $fetchOne->willThrowException($fetchOneThrows);
-        } else {
-            $fetchOne->willReturn($fetchOneResult);
-        }
+        // Only the checkpoint query injects a batch failure; startup locking must complete first.
+        $connection->method('fetchOne')->willReturnCallback(function (string $sql) use ($fetchOneThrows, $fetchOneResult): mixed {
+            if (str_contains($sql, 'SELECT name FROM projections')) {
+                $this->startup[] = 'lock';
+            }
+            if (! str_contains($sql, 'SELECT last_position')) {
+                return false;
+            }
+            if ($fetchOneThrows !== null) {
+                throw $fetchOneThrows;
+            }
+
+            return $fetchOneResult;
+        });
 
         return $connection;
     }

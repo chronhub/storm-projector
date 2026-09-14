@@ -24,11 +24,19 @@ use Throwable;
 interface ProjectionRunStore
 {
     /**
+     * Locks the run state until the caller's transaction ends, including an absent name.
+     *
+     * Call before reading startup guards and hold through topology adoption and lease claim.
+     * The caller must roll back preparation writes when its claim is declined.
+     */
+    public function lockForRun(string $name): void;
+
+    /**
      * Idempotently create the row, status `idle` and checkpoint 0, or refresh its declared topology,
      * keeping the existing status/checkpoint/lease.
      *
-     * The overwrite is only safe because the runner gates before calling ensure: a selection that drifted
-     * over a kept checkpoint is refused there as `ProjectionOutOfDate`, with the stored topology left
+     * The runner holds `lockForRun()` through the gates and lease claim, rolling back a declined claim.
+     * A selection that drifted over a kept checkpoint is refused there as `ProjectionOutOfDate`, with the stored topology left
      * intact as the evidence. `$eventClasses` holds the declared event classes, the dev's intent, not the
      * alias-resolved stored types, so an added `#[EventType]` alias never reads as a topology change.
      * `$sourceStream` is the read source of a DerivedStreamProjection.
@@ -119,6 +127,11 @@ interface ProjectionRunStore
      * Release the lease, only the current owner, and set the final status, `idle` by default. A run that
      * stopped on a cross-process `pause` passes ProjectionStatus::Paused so the pause sticks instead of
      * reverting to `idle`.
+     *
+     * `Paused` is a PRESERVATION either way, never an assertion: it holds a pause the row still carries,
+     * whether the caller read it a cycle ago or an operator landed it during the release window, and it
+     * is dropped for `idle` once the row has left `paused`. So a resume racing a run that already chose
+     * to keep the pause wins, rather than being reverted by the release that follows it.
      *
      * When the run ended on an unrecoverable error, pass ProjectionStatus::Failed and the `$error`: the
      * row records `failed_at` as now, plus the error class and the capped message, for triage. The full

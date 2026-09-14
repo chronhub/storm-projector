@@ -27,6 +27,31 @@ use Storm\Projector\Tests\Fixture\DemoMigratedReadModel;
 final class MigratedReadModelBehaviorTest extends TestCase
 {
     #[Test]
+    public function a_subclass_can_probe_its_own_migrated_table_through_the_inherited_helper(): void
+    {
+        $host = new readonly class() extends Fixture\InheritedMigratedReadModel
+        {
+            protected function tableName(): string
+            {
+                return 'rm_inherited_orders';
+            }
+
+            public function exists(Connection $connection): bool
+            {
+                return $this->tableExists($connection);
+            }
+        };
+        $connection = $this->createMock(Connection::class);
+        $connection->expects(self::once())->method('quoteSingleIdentifier')
+            ->with('rm_inherited_orders')
+            ->willReturn('"rm_inherited_orders"');
+        $connection->expects(self::once())->method('fetchOne')
+            ->with(self::stringContains(':table'), ['table' => '"rm_inherited_orders"'])
+            ->willReturn('rm_inherited_orders');
+        self::assertTrue($host->exists($connection));
+    }
+
+    #[Test]
     public function initialize_passes_when_the_migrated_table_exists(): void
     {
         new DemoMigratedReadModel(tablePresent: true)->initialize($this->createStub(Connection::class));
@@ -46,10 +71,8 @@ final class MigratedReadModelBehaviorTest extends TestCase
     #[Group('adversarial')]
     public function a_schema_qualified_table_name_is_refused_at_initialize(): void
     {
-        // the two probes disagree on a qualified name: to_regclass parses the qualifier, while the
-        // quoted TRUNCATE and content probe wrap the whole string in ONE identifier; without this
-        // gate the declaration passed initialize() and failed later at clear() with a confusing
-        // missing-relation error, far from the declaration that caused it
+        // the lifecycle quotes the declaration as one identifier, so a qualified name would make the
+        // dot literal instead of selecting a schema. Refuse it here with the authoring rule.
         $host = new readonly class()
         {
             use MigratedReadModelBehavior;

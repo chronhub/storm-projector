@@ -207,7 +207,7 @@ final readonly class ProjectionManagement
         foreach ($this->lanes->distinct() as $lane) {
             $row = $lane->store->findRow($name);
             if ($row !== null) {
-                $matches[] = [$lane, $row];
+                $matches[] = $lane;
             }
         }
 
@@ -221,10 +221,15 @@ final readonly class ProjectionManagement
             throw DuplicateProjection::splitAcrossHomes($name);
         }
 
-        [$located, $row] = $matches[0];
+        $located = $matches[0];
 
-        $located->connection->transactional(function () use ($located, $name, $row): void {
+        $located->connection->transactional(function () use ($located, $name): void {
             $located->store->lockAndAssertNotRunning($name); // in-tx guard: serializes a concurrent claim
+            $row = $located->store->findRow($name);
+
+            if ($row === null) {
+                throw UnknownProjection::named($name);
+            }
 
             if ($row->targetStream !== null) {
                 $this->links->deleteLinks($located->connection, $row->targetStream); // a link projection's rows

@@ -35,12 +35,15 @@ final readonly class DbalProjectionStore implements ProjectionStore
     private const string COLUMNS = 'name, status, last_position, mode, categories, event_classes, source_stream, source_revision, target_stream, target_prefix, lease_owner, lease_until, last_heartbeat_at, pause_until, generation, failed_at, error_message, error_class';
 
     /**
-     * The mint lock, taken by BOTH {@see ensure()} and its {@see lockAndAssertNotRunning()} fallback:
-     * the same name must hash to the same key from either call site, or the two stop serializing
+     * The mint lock shared by startup and row creation. The same name must hash to the same key
+     * from every call site, or they stop serializing
      * against each other. `hashtextextended(:key, 0)` rides Postgres's 64-bit advisory space, the
      * same shape as every other advisory lock in the codebase; a prefixed key namespaces it instead
-     * of a dedicated lock-class integer, which only bought 32 bits of the pair and made two
-     * unrelated projection names collide far sooner than the 64-bit space needs to.
+     * of a dedicated lock-class integer. It is acquired by:
+     * - `ensure()` for row creation.
+     * - `lockForRun()` before startup reads.
+     * - `lockAndAssertNotRunning()` when its row is absent.
+     * - `lockForForget()` when its row is absent.
      */
     private const string MINT_LOCK_SQL = 'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))';
 
@@ -120,6 +123,12 @@ final readonly class DbalProjectionStore implements ProjectionStore
         if ($advanced === 0) {
             throw LeaseLost::to($name, $owner);
         }
+    }
+
+    public function lockForRun(string $name): void
+    {
+        $this->connection->executeStatement(self::MINT_LOCK_SQL, ['key' => self::mintLockKey($name)]);
+        $this->connection->fetchOne('SELECT name FROM projections WHERE name = :name FOR UPDATE', ['name' => $name]);
     }
 
     public function claimLease(string $name, string $owner, int $ttlSeconds): bool
@@ -217,9 +226,17 @@ final readonly class DbalProjectionStore implements ProjectionStore
             <<<'SQL'
                 UPDATE projections SET
                     lease_owner = NULL, lease_until = NULL, updated_at = clock_timestamp(),
-                    -- preserve an operator's pause that landed in the runner's release window (a stop
-                    -- intentionally resolves to Idle, so it is not preserved)
-                    status = CASE WHEN status = :paused THEN status ELSE :status END
+                    status = CASE
+                        -- preserve an operator's pause that landed in the runner's release window;
+                        -- a requested stop intentionally resolves to Idle and is not preserved
+                        WHEN status = :paused THEN status
+                        -- the caller's own `paused` is an ECHO of a mark it read a cycle ago, never an
+                        -- assertion of its own: a resume answering that mark while the run wound down has
+                        -- already left the row, so reinstating `paused` here would revert a verb the
+                        -- operator watched succeed, on a lease that is being dropped in the same statement
+                        WHEN CAST(:status AS text) = :paused THEN :idle
+                        ELSE :status
+                    END
                 WHERE name = :name AND lease_owner = :owner
                 SQL,
             [
@@ -227,6 +244,7 @@ final readonly class DbalProjectionStore implements ProjectionStore
                 'owner' => $owner,
                 'status' => $status->value,
                 'paused' => ProjectionStatus::Paused->value,
+                'idle' => ProjectionStatus::Idle->value,
             ],
         );
     }
@@ -307,8 +325,17 @@ final readonly class DbalProjectionStore implements ProjectionStore
 
         $affected = $this->connection->executeStatement(
             /** @lang PostgreSQL */
-            'UPDATE projections SET status = :status, pause_until = NULL, updated_at = clock_timestamp() WHERE name = :name AND status IN (:from)',
-            ['name' => $name, 'status' => ProjectionStatus::Idle->value, 'from' => ProjectionStatus::valuesOf(...$from)],
+            <<<'SQL'
+                UPDATE projections SET
+                    status = CASE
+                        WHEN lease_owner IS NOT NULL AND lease_until > clock_timestamp() THEN :running
+                        ELSE :idle
+                    END,
+                    pause_until = NULL,
+                    updated_at = clock_timestamp()
+                WHERE name = :name AND status IN (:from)
+                SQL,
+            ['name' => $name, 'running' => ProjectionStatus::Running->value, 'idle' => ProjectionStatus::Idle->value, 'from' => ProjectionStatus::valuesOf(...$from)],
             ['from' => ArrayParameterType::STRING],
         );
 
@@ -435,6 +462,22 @@ final readonly class DbalProjectionStore implements ProjectionStore
 
         if ((int) $isLive === 1) {
             throw ProjectionBusy::running($name);
+        }
+    }
+
+    public function lockForForget(string $name): void
+    {
+        $row = $this->connection->fetchOne(
+            'SELECT 1 FROM projections WHERE name = :name FOR UPDATE',
+            ['name' => $name],
+        );
+
+        if ($row === false) {
+            $this->connection->executeStatement(self::MINT_LOCK_SQL, ['key' => self::mintLockKey($name)]);
+            $this->connection->fetchOne(
+                'SELECT 1 FROM projections WHERE name = :name FOR UPDATE',
+                ['name' => $name],
+            );
         }
     }
 

@@ -190,6 +190,19 @@ final class RunProjectionCommand extends Command
             return Command::FAILURE;
         }
 
+        if (! $outcome->completed()) {
+            // The run began and another worker took its lease under it, so it stopped after its last
+            // committed batch. Nothing is broken and the head is the new owner's, but the work this
+            // process was launched for is unfinished, and a supervisor set to relaunch on failure only
+            // brings the worker back if the exit says so.
+            $io->error(sprintf(
+                'Projection "%s" handed off: another worker claimed its lease mid-run, so this one stopped after its last committed batch. Nothing is broken and nothing needs undoing; the new owner is advancing it, and storm:projection:status names them. The non-zero exit is the hand-off, so a supervisor relaunches this worker.',
+                $name,
+            ));
+
+            return Command::FAILURE;
+        }
+
         $io->success(sprintf('Projection "%s" finished.', $name));
 
         return Command::SUCCESS;
@@ -238,7 +251,8 @@ final class RunProjectionCommand extends Command
      *
      * The three causes call for opposite gestures, which is why they are told apart: an operator's own
      * hold waits for their verb, another worker holding the lease needs nothing at all, and a mark that
-     * won the claim race means the operator's own verb took effect.
+     * won the claim race means the operator's own verb took effect. A lease lost mid-run is none of
+     * them, the run having begun, and is worded at its own exit.
      */
     private function standDownMessage(string $name, RunOutcome $outcome): string
     {

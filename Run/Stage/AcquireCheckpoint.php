@@ -15,7 +15,7 @@ use Storm\Projector\Store\ProjectionRunStore;
  * Reads and locks, `FOR UPDATE`, the projection's checkpoint into the state. Runs inside the batch
  * transaction so the later advance is atomic with the events applied. Re-asserts lease ownership in the
  * same lock: a worker that stalled past its TTL and had the lease claimed by another gets `LeaseLost`
- * here, before any read/apply, and the runner exits cleanly.
+ * here, before any read/apply, and the runner ends the run as a hand-off rather than a failure.
  *
  * @see LeaseLost
  */

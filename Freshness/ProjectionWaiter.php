@@ -22,8 +22,8 @@ use Throwable;
 
 /**
  * The DBAL concrete of the contracted {@see \Storm\Contracts\Projector\ProjectionFreshness} port: the
- * checkpoint is polled through `ProjectionStore::findRow()`, the head through
- * `StreamReader::safeHeadPosition()`.
+ * checkpoint is polled through `ProjectionStore::findRow()`. Current-state probes use
+ * `StreamReader::safeHeadPosition()`; request-time waits freeze `StreamReader::committedHeadPosition()`.
  *
  * WHICH head a projection is measured against depends on its kind, resolved by `headFor()`: a derived
  * consumer's freshness is its PRODUCER's link head, honest only once the producer has certified the
@@ -114,7 +114,9 @@ final readonly class ProjectionWaiter implements ProjectionFreshness
         // would be read right here as "nothing to catch up on". Otherwise a MISSING row is a projection
         // that never ran: behind by everything, never "fresh"; answering true there would hand a
         // blue/green swap the green light for a read model that does not exist yet.
-        return $head === 0 || ($row !== null && $row->lastPosition >= $head);
+        $fresh = $head === 0 || ($row !== null && $row->lastPosition >= $head);
+
+        return $fresh && ($row === null || $this->sourceRevisionIsCurrent($row));
     }
 
     /**
@@ -132,30 +134,51 @@ final readonly class ProjectionWaiter implements ProjectionFreshness
         // wall-clock scheduling effect, not a deterministic semantic distinction a unit can hold
         int $pollMs = 50,
     ): bool {
-        // Freeze the GLOBAL safe head, the read-your-writes boundary as of the request. A filtered
+        // Freeze the GLOBAL committed head, the read-your-writes boundary as of the request. A filtered
         // projection polls that frozen position directly, one row read per tick, the same cost as
         // the token wait this method reads as a sibling of. A derived consumer cannot ride the
         // freeze: while its producer is behind, the global head is only a conservative provisional
         // answer, and once the producer certifies the frozen tail the reachable target may collapse
-        // to a lower link head. The derived path therefore pays up to four reads per tick, consumer
-        // row, revision, producer row and link head, up to a hundred times on the HTTP request
+        // to a lower link head. The derived path therefore pays up to five reads per tick: consumer
+        // row, revision, producer row, link head and the final revision certification. It can poll up
+        // to a hundred times on the HTTP request
         // path, where the frozen path pays one; the cost is accepted, since the one-read economy
         // was exactly what let a rebuilt derived set answer green.
         $row = $this->guard('projection checkpoint read', fn () => $this->store->findRow($name));
-        $head = $this->safeHead();
+        $head = $this->committedHead();
 
         if ($head === 0) {
-            return $row === null || $this->sourceRevisionIsCurrent($row); // an empty store is trivially at head unless a derived set is stale
+            return $row === null || $this->sourceRevisionIsCurrent($row);
         }
 
         if ($row?->sourceStream !== null) {
             return $this->waitForDerivedHead($name, $row, $head, $timeoutSeconds, $pollMs);
         }
 
-        return $this->pollUntil(function () use ($name, $head): bool {
-            $row = $this->guard('projection checkpoint read', fn () => $this->store->findRow($name));
+        return $this->waitForRoutedHead($name, $head, $timeoutSeconds, $pollMs);
+    }
 
-            return $row !== null && $row->lastPosition >= $head;
+    /**
+     * @param  positive-int  $pollMs
+     */
+    private function waitForRoutedHead(
+        string $name,
+        int $safeHead,
+        float $timeoutSeconds,
+        int $pollMs,
+    ): bool {
+        return $this->pollUntil(function () use ($name, $safeHead): bool {
+            $row = $this->guard('projection checkpoint read', fn () => $this->store->findRow($name));
+            if ($row === null) {
+                return false;
+            }
+
+            $source = $row->sourceStream;
+            if ($source === null) {
+                return $row->lastPosition >= $safeHead;
+            }
+
+            return $this->derivedCandidateIsFresh($row, $source, $this->producerNameOf($source), $safeHead);
         }, $timeoutSeconds, $pollMs);
     }
 
@@ -261,28 +284,42 @@ final readonly class ProjectionWaiter implements ProjectionFreshness
 
         return $this->pollUntil(function () use ($name, $source, $sourceName, $producer, $safeHead): bool {
             $consumer = $this->guard('projection checkpoint read', fn () => $this->store->findRow($name));
-            if ($consumer === null
-                || $consumer->sourceStream?->toString() !== $sourceName
-                || ! $this->sourceRevisionIsCurrent($consumer)) {
+            if ($consumer === null || $consumer->sourceStream?->toString() !== $sourceName) {
                 return false;
             }
 
-            if ($producer !== null) {
-                $producerRow = $this->guard('producer checkpoint read', fn (): ?ProjectionRow => $this->store->findRow($producer));
-                if ($producerRow === null || $producerRow->lastPosition < $safeHead) {
-                    return false; // the request-time tail is still undecided
-                }
-            }
-
-            $linkHead = $this->guard('derived stream head read', fn (): int => $this->derivedStreamHead->headFor($source));
-            if ($producer === null && $linkHead === 0) {
-                return $consumer->lastPosition >= $safeHead; // no producer and no link: no evidence for a lower cap
-            }
-
-            return $consumer->lastPosition >= min($safeHead, $linkHead);
+            return $this->derivedCandidateIsFresh($consumer, $source, $producer, $safeHead);
         }, $timeoutSeconds, $pollMs);
     }
 
+    private function derivedCandidateIsFresh(
+        ProjectionRow $consumer,
+        StreamName $source,
+        ?string $producer,
+        int $safeHead,
+    ): bool {
+        if (! $this->sourceRevisionIsCurrent($consumer)) {
+            return false;
+        }
+
+        if ($producer !== null) {
+            $producerRow = $this->guard('producer checkpoint read', fn (): ?ProjectionRow => $this->store->findRow($producer));
+            if ($producerRow === null || $producerRow->lastPosition < $safeHead) {
+                return false; // the request-time tail is still undecided
+            }
+        }
+
+        $linkHead = $this->guard('derived stream head read', fn (): int => $this->derivedStreamHead->headFor($source));
+        $fresh = $producer === null && $linkHead === 0
+            ? $consumer->lastPosition >= $safeHead
+            : $consumer->lastPosition >= min($safeHead, $linkHead);
+
+        return $fresh && $this->sourceRevisionIsCurrent($consumer);
+    }
+
+    /**
+     * @phpstan-impure
+     */
     private function sourceRevisionIsCurrent(ProjectionRow $row): bool
     {
         if ($row->sourceStream === null) {
@@ -302,6 +339,13 @@ final readonly class ProjectionWaiter implements ProjectionFreshness
         $safeHead = $this->guard('safe head read', fn () => $this->streamReader->safeHeadPosition());
 
         return $safeHead === null ? 0 : $this->ordinal($safeHead);
+    }
+
+    private function committedHead(): int
+    {
+        $head = $this->guard('committed head read', fn () => $this->streamReader->committedHeadPosition());
+
+        return $head === null ? 0 : $this->ordinal($head);
     }
 
     /**

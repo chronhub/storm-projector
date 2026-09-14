@@ -202,6 +202,7 @@ final class ProjectionWaiterTest extends TestCase
 
         $streamReader = $this->createStub(StreamReader::class);
         $streamReader->method('safeHeadPosition')->willReturn(SequencePosition::fromInt(7));
+        $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
         $linkHead = $this->createStub(DerivedStreamHead::class);
         $linkHead->method('headFor')->willReturn(2);
 
@@ -233,6 +234,7 @@ final class ProjectionWaiterTest extends TestCase
 
         $streamReader = $this->createStub(StreamReader::class);
         $streamReader->method('safeHeadPosition')->willReturn(SequencePosition::fromInt(7));
+        $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
         $linkHead = $this->createStub(DerivedStreamHead::class);
         $linkHead->method('headFor')->willReturn(2);
 
@@ -260,6 +262,7 @@ final class ProjectionWaiterTest extends TestCase
         $store->method('findRow')->willReturn($this->derivedRow('feed_consumer', 0, 'stub-link-target'));
         $streamReader = $this->createStub(StreamReader::class);
         $streamReader->method('safeHeadPosition')->willReturn(null);
+        $streamReader->method('committedHeadPosition')->willReturn(null);
 
         $waiter = new ProjectionWaiter(
             $store,
@@ -270,6 +273,32 @@ final class ProjectionWaiterTest extends TestCase
         );
 
         self::assertFalse($waiter->waitForHead('feed_consumer', timeoutSeconds: 0.0, pollMs: 1));
+    }
+
+    #[Test]
+    public function an_empty_store_checks_a_fresh_derived_revision_once(): void
+    {
+        $store = $this->createStub(ProjectionStore::class);
+        $store->method('findRow')->willReturn($this->derivedRow('feed_consumer', 0, 'stub-link-target'));
+        $streamReader = $this->createStub(StreamReader::class);
+        $streamReader->method('committedHeadPosition')->willReturn(null);
+        $reads = 0;
+        $revision = $this->createStub(DerivedStreamRevision::class);
+        $revision->method('revisionFor')->willReturnCallback(function () use (&$reads): int {
+            $reads++;
+
+            return 0;
+        });
+        $waiter = new ProjectionWaiter(
+            $store,
+            $streamReader,
+            new ProjectionRegistry,
+            $this->createStub(DerivedStreamHead::class),
+            $revision,
+        );
+
+        self::assertTrue($waiter->waitForHead('feed_consumer', timeoutSeconds: 0.0, pollMs: 1));
+        self::assertSame(1, $reads);
     }
 
     #[Test]
@@ -289,6 +318,7 @@ final class ProjectionWaiterTest extends TestCase
 
         $streamReader = $this->createStub(StreamReader::class);
         $streamReader->method('safeHeadPosition')->willReturn(SequencePosition::fromInt(7));
+        $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
         $linkHead = $this->createStub(DerivedStreamHead::class);
         $linkHead->method('headFor')->willReturn(2);
 
@@ -414,6 +444,29 @@ final class ProjectionWaiterTest extends TestCase
     }
 
     #[Test]
+    public function waiting_for_head_reads_the_committed_target_once_and_never_uses_it_as_a_scan_bound(): void
+    {
+        $store = $this->createStub(ProjectionStore::class);
+        $store->method('findRow')->willReturn($this->rowAtPosition(5));
+
+        $streamReader = $this->createMock(StreamReader::class);
+        $streamReader->expects(self::once())
+            ->method('committedHeadPosition')
+            ->willReturn(SequencePosition::fromInt(5));
+        $streamReader->expects(self::never())->method('safeHeadPosition');
+
+        $waiter = new ProjectionWaiter(
+            $store,
+            $streamReader,
+            new ProjectionRegistry,
+            $this->createStub(DerivedStreamHead::class),
+            $this->createStub(DerivedStreamRevision::class),
+        );
+
+        self::assertTrue($waiter->waitForHead('rm', timeoutSeconds: 0.05, pollMs: 1));
+    }
+
+    #[Test]
     public function waiting_for_head_keeps_a_missing_projection_row_behind(): void
     {
         $waiter = $this->waiter(new ProjectionRegistry, [], safeHead: 5, linkHead: 0);
@@ -495,6 +548,105 @@ final class ProjectionWaiterTest extends TestCase
     }
 
     #[Test]
+    public function direct_freshness_probes_never_read_a_derived_revision(): void
+    {
+        $store = $this->createStub(ProjectionStore::class);
+        $store->method('findRow')->willReturn($this->rowAtPosition(5));
+        $streamReader = $this->createStub(StreamReader::class);
+        $streamReader->method('safeHeadPosition')->willReturn(SequencePosition::fromInt(5));
+        $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(5));
+        $revision = $this->createMock(DerivedStreamRevision::class);
+        $revision->expects(self::never())->method('revisionFor');
+        $waiter = new ProjectionWaiter($store, $streamReader, new ProjectionRegistry, $this->createStub(DerivedStreamHead::class), $revision);
+
+        self::assertTrue($waiter->isAtHead('account_balance'));
+        self::assertTrue($waiter->waitForHead('account_balance', timeoutSeconds: 0.0, pollMs: 1));
+    }
+
+    #[Test]
+    public function a_stale_revision_rejects_freshness_before_reading_the_derived_head(): void
+    {
+        foreach (['isAtHead', 'waitForHead'] as $method) {
+            $store = $this->createStub(ProjectionStore::class);
+            $store->method('findRow')->willReturn($this->derivedRow('feed_consumer', 7, 'stub-link-target'));
+            $streamReader = $this->createStub(StreamReader::class);
+            $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
+            $head = $this->createMock(DerivedStreamHead::class);
+            $head->expects(self::never())->method('headFor');
+            $revision = $this->createMock(DerivedStreamRevision::class);
+            $revision->expects(self::once())->method('revisionFor')->willReturn(1);
+            $waiter = new ProjectionWaiter($store, $streamReader, new ProjectionRegistry, $head, $revision);
+
+            self::assertFalse($method === 'isAtHead'
+                ? $waiter->isAtHead('feed_consumer')
+                : $waiter->waitForHead('feed_consumer', timeoutSeconds: 0.0, pollMs: 1));
+        }
+    }
+
+    #[Test]
+    public function a_negative_derived_candidate_does_not_reread_its_revision(): void
+    {
+        foreach (['isAtHead', 'waitForHead'] as $method) {
+            $store = $this->createStub(ProjectionStore::class);
+            $store->method('findRow')->willReturn($this->derivedRow('feed_consumer', 1, 'stub-link-target'));
+            $streamReader = $this->createStub(StreamReader::class);
+            $streamReader->method('safeHeadPosition')->willReturn(SequencePosition::fromInt(7));
+            $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
+            $head = $this->createStub(DerivedStreamHead::class);
+            $head->method('headFor')->willReturn(2);
+            $revision = $this->createMock(DerivedStreamRevision::class);
+            $revision->expects(self::once())->method('revisionFor')->willReturn(0);
+            $waiter = new ProjectionWaiter($store, $streamReader, new ProjectionRegistry, $head, $revision);
+
+            self::assertFalse($method === 'isAtHead'
+                ? $waiter->isAtHead('feed_consumer')
+                : $waiter->waitForHead('feed_consumer', timeoutSeconds: 0.0, pollMs: 1));
+        }
+    }
+
+    #[Test]
+    public function a_positive_derived_candidate_rereads_and_rejects_a_changed_revision(): void
+    {
+        foreach (['isAtHead', 'waitForHead'] as $method) {
+            $store = $this->createStub(ProjectionStore::class);
+            $store->method('findRow')->willReturn($this->derivedRow('feed_consumer', 2, 'stub-link-target'));
+            $streamReader = $this->createStub(StreamReader::class);
+            $streamReader->method('safeHeadPosition')->willReturn(SequencePosition::fromInt(7));
+            $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
+            $head = $this->createStub(DerivedStreamHead::class);
+            $head->method('headFor')->willReturn(2);
+            $revision = $this->createMock(DerivedStreamRevision::class);
+            $revision->expects(self::exactly(2))->method('revisionFor')->willReturnOnConsecutiveCalls(0, 1);
+            $waiter = new ProjectionWaiter($store, $streamReader, new ProjectionRegistry, $head, $revision);
+
+            self::assertFalse($method === 'isAtHead'
+                ? $waiter->isAtHead('feed_consumer')
+                : $waiter->waitForHead('feed_consumer', timeoutSeconds: 0.0, pollMs: 1));
+        }
+    }
+
+    #[Test]
+    public function a_direct_wait_rechecks_a_row_that_appears_as_derived_before_its_poll(): void
+    {
+        $reads = 0;
+        $store = $this->createStub(ProjectionStore::class);
+        $store->method('findRow')->willReturnCallback(function () use (&$reads): ProjectionRow {
+            return ++$reads === 1
+                ? $this->rowAtPosition(0)
+                : $this->derivedRow('feed_consumer', 2, 'stub-link-target');
+        });
+        $streamReader = $this->createStub(StreamReader::class);
+        $streamReader->method('committedHeadPosition')->willReturn(SequencePosition::fromInt(7));
+        $head = $this->createStub(DerivedStreamHead::class);
+        $head->method('headFor')->willReturn(2);
+        $revision = $this->createMock(DerivedStreamRevision::class);
+        $revision->expects(self::exactly(2))->method('revisionFor')->willReturnOnConsecutiveCalls(0, 1);
+        $waiter = new ProjectionWaiter($store, $streamReader, new ProjectionRegistry, $head, $revision);
+
+        self::assertFalse($waiter->waitForHead('feed_consumer', timeoutSeconds: 0.0, pollMs: 1));
+    }
+
+    #[Test]
     public function a_fan_out_prefix_that_does_not_match_leaves_the_stream_external(): void
     {
         // BOTH conditions gate the fan-out arm: a registered fan-out whose prefix does not cover
@@ -520,6 +672,7 @@ final class ProjectionWaiterTest extends TestCase
 
         $streamReader = $this->createStub(StreamReader::class);
         $streamReader->method('safeHeadPosition')->willReturn($safeHead === null ? null : SequencePosition::fromInt($safeHead));
+        $streamReader->method('committedHeadPosition')->willReturn($safeHead === null ? null : SequencePosition::fromInt($safeHead));
 
         $derivedStreamHead = $this->createStub(DerivedStreamHead::class);
         $derivedStreamHead->method('headFor')->willReturn($linkHead);

@@ -11,6 +11,9 @@ use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Storm\Contracts\Projector\ProjectionCommitListener;
 use Storm\Projector\Run\CompositeProjectionCommitListener;
+use Storm\Projector\Telemetry\ListenerFailureContext;
+use Storm\Projector\Telemetry\ProjectorObservability;
+use Throwable;
 
 final class CompositeProjectionCommitListenerTest extends TestCase
 {
@@ -66,6 +69,76 @@ final class CompositeProjectionCommitListenerTest extends TestCase
         }
 
         $this->assertSame(['metrics:account_balance'], $log->getArrayCopy(), 'the sibling was served despite the earlier failure');
+    }
+
+    #[Test]
+    public function two_failing_delegates_are_both_surfaced_to_observability(): void
+    {
+        $first = new RuntimeException('purger down');
+        $second = new RuntimeException('application hook down');
+        $failures = [];
+        $obs = $this->createMock(ProjectorObservability::class);
+        $obs->expects(self::exactly(2))->method('recordListenerFailure')->willReturnCallback(
+            static function (ListenerFailureContext $context) use (&$failures): void {
+                $failures[] = $context;
+            },
+        );
+        $healthy = $this->createMock(ProjectionCommitListener::class);
+        $healthy->expects(self::once())->method('committed')->with('account_balance');
+        $composite = new CompositeProjectionCommitListener([
+            self::failing($first),
+            $healthy,
+            self::failing($second),
+        ], $obs);
+
+        try {
+            $composite->committed('account_balance');
+            self::fail('The first failure must escape after fan-out.');
+        } catch (Throwable $error) {
+            self::assertSame($first, $error);
+            $obs->recordListenerFailure(new ListenerFailureContext('account_balance', $error));
+        }
+
+        self::assertCount(2, $failures);
+        self::assertSame([$second, $first], array_column($failures, 'error'));
+        self::assertSame(['account_balance', 'account_balance'], array_column($failures, 'projection'));
+    }
+
+    #[Test]
+    public function healthy_delegates_do_not_emit_failures(): void
+    {
+        $obs = $this->createMock(ProjectorObservability::class);
+        $obs->expects(self::never())->method('recordListenerFailure');
+        $healthy = $this->createMock(ProjectionCommitListener::class);
+        $healthy->expects(self::once())->method('committed')->with('healthy');
+        $this->expectOutputString('');
+
+        new CompositeProjectionCommitListener([$healthy], $obs)->committed('healthy');
+    }
+
+    #[Test]
+    public function a_single_failure_is_relayed_without_direct_observability(): void
+    {
+        $error = new RuntimeException('only failure');
+        $obs = $this->createMock(ProjectorObservability::class);
+        $obs->expects(self::never())->method('recordListenerFailure');
+        $composite = new CompositeProjectionCommitListener([self::failing($error)], $obs);
+        $this->expectExceptionObject($error);
+
+        $composite->committed('account_balance');
+    }
+
+    private static function failing(Throwable $error): ProjectionCommitListener
+    {
+        return new readonly class($error) implements ProjectionCommitListener
+        {
+            public function __construct(private Throwable $error) {}
+
+            public function committed(string $projection): void
+            {
+                throw $this->error;
+            }
+        };
     }
 
     /**

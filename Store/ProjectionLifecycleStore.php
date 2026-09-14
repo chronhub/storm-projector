@@ -77,9 +77,16 @@ interface ProjectionLifecycleStore
     public function pause(string $name, ?int $forSeconds = null, ProjectionStatus ...$from): bool;
 
     /**
-     * Resume from a pause, timed or indefinite, only while the row is still in one of `$from`: back to
-     * `idle`, the pause horizon cleared. Same compare-and-set contract as `pause()`: the caller passes
-     * the states its own predicate accepted, never a list this method hardcodes on its behalf.
+     * Resume from a pause, timed or indefinite, only while the row is still in one of `$from`, the pause
+     * horizon cleared. Same compare-and-set contract as `pause()`: the caller passes the states its own
+     * predicate accepted, never a list this method hardcodes on its behalf.
+     *
+     * The status it resumes TO resolves against the LIVE LEASE, in the same statement, as `requestStop()`
+     * does: pausing a running projection does not stop its worker, only asks it to wind down at its next
+     * cycle, so a resume arriving first lands on a row whose lease is still live and whose run never
+     * broke. That resumes to `running`, since `idle` would describe a projection at rest that is in fact
+     * mid-batch and would put it out of reach of `stop`. With no live lease there is no run to return to,
+     * so it resumes to `idle` and the projection is claimable again.
      *
      * @return bool false when the row was no longer in `$from`
      *
@@ -137,6 +144,16 @@ interface ProjectionLifecycleStore
      * @throws Exception
      */
     public function lockAndAssertNotRunning(string $name): void;
+
+    /**
+     * Wait for the current batch and exclude subsequent batches until the caller commits.
+     *
+     * Call inside the home transaction before erasing read-model rows. A live lease remains valid;
+     * only the batch transaction must finish. An absent checkpoint must serialize with its creation.
+     *
+     * @throws Exception
+     */
+    public function lockForForget(string $name): void;
 
     /**
      * Read one projection's state row, or null when the name has no row; a transition caller reads

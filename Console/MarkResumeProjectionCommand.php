@@ -9,7 +9,8 @@ use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Input\InputInterface;
 
 /**
- * Resume a paused projection, timed or indefinite: back to `idle`, the pause horizon cleared.
+ * Resume a paused projection and clear its pause horizon. A live run remains `running`; an unleased
+ * projection returns to `idle`.
  *
  * Examples:
  *

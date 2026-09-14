@@ -13,6 +13,7 @@ use Random\RandomException;
 use Storm\Contracts\Chronicler\EventTypeMapper;
 use Storm\Contracts\Projector\ProjectionCommitListener;
 use Storm\EventLinks\DerivedStreamRevision;
+use Storm\Projector\Definition\PersistentProjection;
 use Storm\Projector\Exception\InvalidRunOptions;
 use Storm\Projector\Exception\LeaseLost;
 use Storm\Projector\Exception\ProjectionHomeMismatch;
@@ -70,8 +71,8 @@ final readonly class ProjectionRunner
     /**
      * @param  (callable(): bool)|null  $shouldStop  polled between batches; the console wires it to a
      *                                               SIGTERM/SIGINT handler for a graceful daemon stop
-     * @return RunOutcome whether the run began, and why it did not: a stand-down is not a failure, and
-     *                    it is not a finished catch-up either
+     * @return RunOutcome whether the run began, whether it ran itself out, and why it did not: a
+     *                    stand-down and a lease lost mid-run are neither failures nor finished catch-ups
      *
      * @throws UnknownProjection when no projection is registered under `$name`
      * @throws UnsupportedProjection when `$name` is a QueryProjection rather than a persistent one, or
@@ -98,9 +99,9 @@ final readonly class ProjectionRunner
      */
     public function run(string $name, RunOptions $options, ?callable $shouldStop = null): RunOutcome
     {
-        $prepared = $this->preflight->prepare($name, $options);
-        if ($prepared instanceof RunRefusal) {
-            return RunOutcome::stoodDown(StandDown::NotRunnable, $prepared->status);
+        $prepared = $this->prepareAndClaim($name, $options);
+        if ($prepared instanceof RunOutcome) {
+            return $prepared;
         }
 
         $projection = $prepared->projection;
@@ -109,19 +110,6 @@ final readonly class ProjectionRunner
         $lane = $prepared->lane;
         $store = $lane->store;
         $connection = $lane->connection;
-
-        if (! $store->claimLease($name, $options->owner, $options->leaseTtl)) {
-            // The claim gates on BOTH a free lease and a runnable status, so its false carries two
-            // causes whose gestures are opposite: wait for the other worker, or resume the hold an
-            // operator put there. Reporting one for the other tells a stood-down operator that nothing
-            // needs doing over a projection that is waiting for their verb. The row is re-read once,
-            // on a path that is already standing down, so the discriminant costs nothing that runs.
-            $status = $store->findRow($name)?->status;
-
-            return $status !== null && ! $status->isRunnable()
-                ? RunOutcome::stoodDown(StandDown::NotRunnable, $status)
-                : RunOutcome::stoodDown(StandDown::LeaseHeld);
-        }
 
         // From here the lease is held: every exit, including a failing initialize(), must release it
         // in the `finally` block, or the projection stays unclaimable for a full TTL with no failure recorded.
@@ -133,6 +121,7 @@ final readonly class ProjectionRunner
         $totalEvents = 0;
         $totalBatches = 0;
         $started = false;
+        $dispossessed = false;
         $previousIsolation = null;
 
         try {
@@ -244,7 +233,10 @@ final readonly class ProjectionRunner
         } catch (LeaseLost) {
             // Another worker claimed the lease while we stalled past the TTL, a clean hand-off, not a
             // failure. Stop looping: the finalStatus stays Idle and failure null, so the owner-gated
-            // releaseLease below is a no-op and the new owner's row is left untouched.
+            // releaseLease below is a no-op and the new owner's row is left untouched. It is still not a
+            // finished catch-up, and the outcome says so: the caller exits non-zero, which is what brings
+            // the worker back under a supervisor that relaunches on failure.
+            $dispossessed = true;
         } catch (RetryableException $e) {
             // A transient deadlock that exhausted the per-batch retry budget, by nature retryable, so
             // leave the projection Idle, the default $finalStatus: a later run / daemon cycle retry.
@@ -281,7 +273,7 @@ final readonly class ProjectionRunner
             }
         }
 
-        return RunOutcome::ran();
+        return $dispossessed ? RunOutcome::dispossessed() : RunOutcome::ran();
     }
 
     /**
@@ -329,5 +321,47 @@ final readonly class ProjectionRunner
             $state->profile->options->backoffMax,
             $state->idleMs + $state->profile->options->backoffStep,
         );
+    }
+
+    private function prepareAndClaim(string $name, RunOptions $options): PreparedRun|RunOutcome
+    {
+        $projection = $this->registry->get($name);
+        if (! $projection instanceof PersistentProjection) {
+            throw UnsupportedProjection::notPersistent($name);
+        }
+
+        $lane = $this->lanes->laneFor($projection);
+        $connection = $lane->connection;
+        $store = $lane->store;
+        $level = $connection->getTransactionNestingLevel();
+        $connection->beginTransaction();
+        try {
+            $store->lockForRun($name);
+            $prepared = $this->preflight->prepare($name, $options);
+            if ($prepared instanceof RunRefusal) {
+                $connection->commit();
+
+                return RunOutcome::stoodDown(StandDown::NotRunnable, $prepared->status);
+            }
+
+            if (! $store->claimLease($name, $options->owner, $options->leaseTtl)) {
+                $status = $store->findRow($name)?->status;
+                $connection->rollBack();
+
+                return $status !== null && ! $status->isRunnable()
+                    ? RunOutcome::stoodDown(StandDown::NotRunnable, $status)
+                    : RunOutcome::stoodDown(StandDown::LeaseHeld);
+            }
+
+            $connection->commit();
+
+            return $prepared;
+        } catch (Throwable $error) {
+            if ($connection->getTransactionNestingLevel() > $level) {
+                $connection->rollBack();
+            }
+
+            throw $error;
+        }
     }
 }

@@ -40,12 +40,9 @@ trait MigratedReadModelBehavior
     abstract protected function tableName(): string;
 
     /**
-     * @throws LogicException when `tableName()` declares a schema-qualified name, refused HERE
-     *                        because the probes disagree on it: `to_regclass` parses the qualifier
-     *                        while the quoted TRUNCATE and content probe wrap the whole string in
-     *                        ONE identifier, so a qualified name would pass this gate and then
-     *                        fail at `clear()` with a confusing missing-relation error; declare
-     *                        the bare name and let the connection's `search_path` own the schema
+     * @throws LogicException when `tableName()` declares a schema-qualified name; every lifecycle probe
+     *                        treats the declaration as one identifier, so the connection's `search_path`
+     *                        must own the schema
      * @throws MigratedTableMissing when the migration-owned table is absent, the migration not having run
      * @throws Exception on a DBAL failure of the existence probe
      */
@@ -74,7 +71,7 @@ trait MigratedReadModelBehavior
         return $tx->fetchOne(
             /** @lang PostgreSQL */
             'SELECT to_regclass(:table)',
-            ['table' => $this->tableName()],
+            ['table' => $tx->quoteSingleIdentifier($this->tableName())],
         ) !== null;
     }
 

@@ -40,7 +40,10 @@ name, categories, event types, target stream, and the mode from which sub-type i
 - **Lease-owned, but never lease-dependent.** Correctness comes from the per-batch checkpoint row
   lock and the monotonic sequence — double-apply is impossible with or without the lease. The lease
   only stops a stalled worker from spinning as a zombie; losing it (`LeaseLost`) is a clean
-  hand-off, the new owner already advancing.
+  hand-off, the new owner already advancing. The lease is re-entrant on its owner: an aged lease
+  nobody claimed is renewed and the run continues, and only a lease that moved ends it. A run so
+  dispossessed is no finished catch-up, so `storm:projection:run` exits non-zero and its supervisor
+  relaunches the worker.
 - **CAS lifecycle.** `idle / running / paused / stopping / failed` transitions are compare-and-swap
   marks — `storm:projection:mark:pause|resume|stop` signal a live daemon from another process, and
   a stale transition loses loudly instead of overwriting.
@@ -95,6 +98,9 @@ positions — orderings the head cannot prove are refused, not coordinated aroun
 
 **2. The safe head is the only skip-proof bound.** No proxy (transaction ids, wall clocks) may
 substitute for it; a bound you cannot prove commit-ordered is not a bound.
+
+The committed head is a wait target, never a scan bound. A freshness wait may freeze a visible
+commit above a young gap, while the projector stays below that gap until the safe head advances.
 
 **3. Refuse rather than coordinate.** Wherever two states could drift — derived checkpoints,
 membership revisions, homes — the design makes the run refuse loudly instead of adding a

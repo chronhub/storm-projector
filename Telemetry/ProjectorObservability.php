@@ -47,7 +47,7 @@ interface ProjectorObservability
     public function recordRun(RunContext $ctx): void;
 
     /**
-     * A post-commit `ProjectionCommitListener` threw and the runner absorbed it: the batch is durably
+     * A post-commit `ProjectionCommitListener` failed: the batch is durably
      * committed, the projection keeps running. The side-channel failure still needs an operator's eye,
      * since a purge that keeps failing means stale caches until TTL, so it is surfaced here, on the port
      * whose own contract is fail-open, instead of flipping a healthy projection to Failed.

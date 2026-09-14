@@ -24,7 +24,8 @@ use Storm\Projector\Store\ProjectionMode;
 /**
  * The run's gate sequence, every check a start must pass BEFORE the lease is claimed: resolution
  * and kind, home, stale migrated content, generation, topology, derived rebuild, target sanity,
- * then the row ensured and its baselines stamped. One entry point, so no gate is skippable by
+ * then the row ensured and its baselines stamped. The runner owns the surrounding transaction;
+ * an elapsed pause resumes only if preparation commits. A later refusal rolls back that resume. One entry point, so no gate is skippable by
  * wiring; the order is the order the refusals surface in, and a refused run leaves the stored row
  * untouched, since it is the evidence of what the checkpoint was built under.
  *

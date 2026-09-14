@@ -116,6 +116,11 @@ final readonly class HomedProjectionStore implements ProjectionCatalog, Projecti
         $this->storeFor($name)->lockAndAssertNotRunning($name);
     }
 
+    public function lockForForget(string $name): void
+    {
+        $this->storeFor($name)->lockForForget($name);
+    }
+
     public function findRow(string $name): ?ProjectionRow
     {
         return $this->storeFor($name)->findRow($name);
@@ -148,6 +153,7 @@ final readonly class HomedProjectionStore implements ProjectionCatalog, Projecti
             if (isset($seen[$row->name])) {
                 throw DuplicateProjection::splitAcrossHomes($row->name);
             }
+            // @infection-ignore-all; only key presence is read, so either boolean marks the name.
             $seen[$row->name] = true;
         }
 

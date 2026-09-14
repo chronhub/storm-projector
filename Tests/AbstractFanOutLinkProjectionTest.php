@@ -21,6 +21,12 @@ use Storm\Stream\StreamName;
 final class AbstractFanOutLinkProjectionTest extends TestCase
 {
     #[Test]
+    public function fan_out_defaults_to_generation_one(): void
+    {
+        self::assertSame(1, $this->fanOut(null)->generation());
+    }
+
+    #[Test]
     #[Group('adversarial')]
     public function apply_refuses_a_target_outside_the_declared_prefix(): void
     {

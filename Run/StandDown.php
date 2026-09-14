@@ -10,6 +10,9 @@ namespace Storm\Projector\Run;
  * They look identical from outside and call for opposite gestures, which is the whole reason they
  * are named: one is an operator's own hold waiting for their verb, one is another worker doing the
  * job correctly, and one is a race an operator won without knowing it.
+ *
+ * A lease lost mid-run is deliberately not a fourth case: that run started, and an outcome that
+ * carried a reason for not starting would contradict itself. `RunOutcome::dispossessed()` holds it.
  */
 enum StandDown: string
 {

@@ -81,7 +81,7 @@ final class StatusProjectionCommand extends Command
             // the document travels even when empty: a scripted caller reads the shape, and the exit
             // code carries the verdict, so an empty answer is not an error to parse around
             $output->writeln(json_encode(
-                ['projections' => array_map(fn (ProjectionRow $row): array => $this->machineRow($row), $rows)],
+                ['projections' => array_map($this->machineRow(...), $rows)],
                 JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES,
             ));
 
@@ -122,7 +122,7 @@ final class StatusProjectionCommand extends Command
         );
 
         if (count($rows) === 1) {
-            $this->renderDetail($io, $rows[array_key_first($rows)]);
+            $this->renderDetail($io, array_first($rows));
         }
 
         return Command::SUCCESS;
