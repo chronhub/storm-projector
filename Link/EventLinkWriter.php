@@ -7,6 +7,7 @@ namespace Storm\Projector\Link;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception;
 use Doctrine\DBAL\ParameterType;
+use Storm\Projector\Definition\BatchProjection;
 use Storm\Projector\Definition\FanOutLinkProjection;
 use Storm\Projector\Definition\LinkProjection;
 use Storm\Projector\Exception\InvalidDerivedNamespace;
@@ -34,6 +35,9 @@ use Storm\Stream\StreamName;
  */
 final readonly class EventLinkWriter
 {
+    /** Links per statement: three bound values each, well inside a statement's parameters. */
+    public const int BATCH_ROWS = 1000;
+
     /**
      * @return bool true if a new link was inserted, false if it already existed
      *
@@ -57,6 +61,63 @@ final readonly class EventLinkWriter
         );
 
         return (int) $affected > 0;
+    }
+
+    /**
+     * Links a whole batch costs one statement per `BATCH_ROWS` links, the density kept: the candidate
+     * links go in as `VALUES`, the ones already written are set aside by an anti-join on
+     * `(target_stream, source_sequence)` BEFORE numbering, so a replayed link consumes no position,
+     * then each target's current `max(target_position)` plus a `row_number()` per target in batch
+     * order numbers the rest, every target from its own maximum. The `ON CONFLICT DO NOTHING` of
+     * `link()` stays as the backstop. The race analysis of `link()` holds unchanged: the checkpoint
+     * row lock serializes the workers of one projection, the primary key surfaces two projections
+     * on one target.
+     *
+     * @param  list<PendingLink>  $links
+     * @return int the number of links actually inserted
+     *
+     * @throws Exception on a DBAL failure of the link insert
+     *
+     * @see BatchProjection
+     */
+    public function linkMany(Connection $tx, array $links): int
+    {
+        $inserted = 0;
+        foreach (array_chunk($links, self::BATCH_ROWS) as $chunk) {
+            $values = [];
+            $params = [];
+            $types = [];
+            foreach ($chunk as $i => $link) {
+                $values[] = "(CAST(:t{$i} AS text), CAST(:s{$i} AS bigint), {$i})";
+                $params["t{$i}"] = $link->target->toString();
+                $params["s{$i}"] = $link->sourceSequence;
+                $types["s{$i}"] = ParameterType::INTEGER;
+            }
+
+            $inserted += (int) $tx->executeStatement(
+                /* language=PostgreSQL */
+                'WITH fresh AS (
+                    SELECT v.target, v.source, v.ord
+                    FROM (VALUES '.implode(', ', $values).') AS v(target, source, ord)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM event_links l WHERE l.target_stream = v.target AND l.source_sequence = v.source
+                    )
+                ),
+                numbered AS (
+                    SELECT f.target, f.source,
+                           COALESCE((SELECT max(l.target_position) FROM event_links l WHERE l.target_stream = f.target), 0)
+                               + row_number() OVER (PARTITION BY f.target ORDER BY f.ord) AS position
+                    FROM fresh f
+                )
+                INSERT INTO event_links (target_stream, target_position, source_sequence)
+                SELECT target, position, source FROM numbered
+                ON CONFLICT (target_stream, source_sequence) DO NOTHING',
+                $params,
+                $types,
+            );
+        }
+
+        return $inserted;
     }
 
     /**

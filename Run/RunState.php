@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Storm\Projector\Run;
 
+use Closure;
 use Storm\Chronicler\Record\EventRecord;
 
 /**
@@ -36,6 +37,9 @@ final class RunState
     /** Current idle backoff for the daemon, in ms. */
     public int $idleMs;
 
+    /** @var Closure(): void|null */
+    public ?Closure $afterBatch = null;
+
     public function __construct(
         public readonly RunProfile $profile,
     ) {
@@ -50,6 +54,7 @@ final class RunState
     {
         // lastPosition is deliberately NOT reset: it is the checkpoint, re-established by the
         // acquire stage at the next attempt, not a per-batch scratch value
+        $this->afterBatch = null;
         $this->records = [];
         $this->applied = 0;
         $this->lastApplied = 0;

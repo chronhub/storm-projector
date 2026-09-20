@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Storm\Projector\Run;
 
+use Closure;
 use Doctrine\DBAL\Exception;
 use Storm\Chronicler\Query\ProjectionFilter;
 use Storm\Chronicler\SafeHead\SafeHeadAdvancer;
@@ -16,7 +17,7 @@ use Storm\Stream\StreamName;
  * The Chronicler-backed event source: the one place that knows both the Projector read window and
  * the store's DBAL filters. Deliberately PostgreSQL-shaped, never a storage abstraction.
  */
-final readonly class ChroniclerEventSource implements ProjectionEventSource
+final readonly class ChroniclerEventSource implements BatchObservationSource, ProjectionEventSource
 {
     public function __construct(
         private StreamReader $streamReader,
@@ -65,6 +66,11 @@ final readonly class ChroniclerEventSource implements ProjectionEventSource
         }
 
         return $max;
+    }
+
+    public function takeBatchObservation(): ?Closure
+    {
+        return $this->safeHeadAdvancer?->takeObservation();
     }
 
     /**

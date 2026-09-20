@@ -8,6 +8,8 @@ use Doctrine\DBAL\Connection;
 use Storm\Chronicler\Record\EventRecord;
 use Storm\Projector\Exception\InvalidDerivedNamespace;
 use Storm\Projector\Link\EventLinkWriter;
+use Storm\Projector\Link\PendingLink;
+use Storm\Stream\StreamName;
 
 use function str_starts_with;
 
@@ -17,7 +19,7 @@ use function str_starts_with;
  * supplies only `name()`, `categories()`, `eventTypes()`, `targetFor()` and `targetPrefix()`; the link
  * plumbing is identical across fan-outs, so it lives here once.
  */
-abstract class AbstractFanOutLinkProjection implements FanOutLinkProjection
+abstract class AbstractFanOutLinkProjection implements BatchProjection, FanOutLinkProjection
 {
     public function __construct(
         protected readonly EventLinkWriter $linkWriter,
@@ -31,20 +33,46 @@ abstract class AbstractFanOutLinkProjection implements FanOutLinkProjection
      */
     public function apply(EventRecord $event, Connection $tx): bool
     {
-        $target = $this->targetFor($event);
+        $target = $this->targetOf($event);
 
-        if ($target === null) {
-            return false;
+        return $target !== null && $this->linkWriter->link($tx, $event->position->toOrdinal(), $target);
+    }
+
+    /**
+     * The batch verb: the targets of the whole batch decided first, under the same guards as
+     * `apply()`, so a refused target refuses the batch before any link is written, then the links
+     * handed to the writer in one call.
+     */
+    public function applyBatch(array $events, Connection $tx): int
+    {
+        $links = [];
+        foreach ($events as $event) {
+            $target = $this->targetOf($event);
+            if ($target !== null) {
+                $links[] = new PendingLink($event->position->toOrdinal(), $target);
+            }
         }
 
-        // targetFor() is dynamic, so its result cannot be checked at startup like the prefix itself:
-        // a target outside the declared prefix would be written here but MISSED by the prefix-scoped
-        // reset/delete, leaking output. Refused at the write seam.
-        if (! str_starts_with($target->toString(), $this->targetPrefix())) {
+        return $links === [] ? 0 : $this->linkWriter->linkMany($tx, $links);
+    }
+
+    /**
+     * The target of one event, null when the event joins no stream, refused when it lies outside
+     * the declared prefix: targetFor() is dynamic, so its result cannot be checked at startup like
+     * the prefix itself, and a target outside the prefix would be written but MISSED by the
+     * prefix-scoped reset/delete, leaking output. Refused at the write seam, for both verbs.
+     *
+     * @throws InvalidDerivedNamespace
+     */
+    private function targetOf(EventRecord $event): ?StreamName
+    {
+        $target = $this->targetFor($event);
+
+        if ($target !== null && ! str_starts_with($target->toString(), $this->targetPrefix())) {
             throw InvalidDerivedNamespace::targetOutsidePrefix(static::class, $target->toString(), $this->targetPrefix());
         }
 
-        return $this->linkWriter->link($tx, $event->position->toOrdinal(), $target);
+        return $target;
     }
 
     public function initialize(Connection $tx): void {} // event_links is framework-owned, created by migration

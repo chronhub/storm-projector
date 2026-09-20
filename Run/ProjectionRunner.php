@@ -151,6 +151,12 @@ final readonly class ProjectionRunner
             do {
                 $batchStart = microtime(true);
                 $seen = $this->runBatch($connection, $pipeline, $state);
+                $afterBatch = $state->afterBatch;
+                $state->afterBatch = null;
+                try {
+                    $afterBatch?->__invoke();
+                } catch (Throwable) {
+                }
                 $totalEvents += $seen;
                 $totalBatches++;
                 try {

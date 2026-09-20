@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Storm\Projector\Run\Stage;
 
 use Closure;
+use Storm\Projector\Run\BatchObservationSource;
 use Storm\Projector\Run\ProjectionEventSource;
 use Storm\Projector\Run\ProjectionReadWindow;
 use Storm\Projector\Run\RunState;
@@ -34,6 +35,7 @@ final readonly class ReadBatch implements Stage
         // the frontier is re-derived per cycle; timed so the probe's cost stays visible
         $probeStart = microtime(true);
         $max = $this->source->watermark($state->profile->sourceStream);
+        $state->afterBatch = $this->source instanceof BatchObservationSource ? $this->source->takeBatchObservation() : null;
         // @infection-ignore-all; equivalent-in-unit: wall-clock telemetry arithmetic, no deterministic reader below the integration suite
         $state->watermarkMs = (microtime(true) - $probeStart) * 1000;
 
